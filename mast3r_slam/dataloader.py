@@ -101,7 +101,8 @@ class EurocDataset(MonocularDataset):
         self.rgb_files = [
             self.dataset_path / "mav0/cam0/data" / f for f in tstamp_rgb[:, 1]
         ]
-        self.timestamps = tstamp_rgb[:, 0]
+        # EuRoC camera timestamps are stored in nanoseconds; TUM trajectories expect seconds.
+        self.timestamps = tstamp_rgb[:, 0].astype(np.float64) / 1e9
         with open(self.dataset_path / "mav0/cam0/sensor.yaml") as f:
             self.cam0 = yaml.load(f, Loader=yaml.FullLoader)
         W, H = self.cam0["resolution"]
@@ -321,7 +322,7 @@ def load_dataset(dataset_path):
     split_dataset_type = dataset_path.split("/")
     if "tum" in split_dataset_type:
         return TUMDataset(dataset_path)
-    if "euroc" in split_dataset_type:
+    if "euroc_mav" in split_dataset_type:
         return EurocDataset(dataset_path)
     if "eth3d" in split_dataset_type:
         return ETH3DDataset(dataset_path)

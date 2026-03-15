@@ -229,8 +229,11 @@ if __name__ == "__main__":
     fps_timer = time.time()
 
     frames = []
+    chunks = []
+    current_chunk = None
 
     while True:
+        add_new_kf = False
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
         last_msg = msg if msg is not None else last_msg
@@ -270,14 +273,29 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
+            current_chunk = {"start_frame_id": frame.frame_id, "end_frame_id": None, "poses": []}
             i += 1
             continue
 
         if mode == Mode.TRACKING:
+            latest_keyframe = keyframes.last_keyframe()
             add_new_kf, match_info, try_reloc = tracker.track(frame)
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
+            if not try_reloc:
+                T_CkCf = (
+                    latest_keyframe.T_WC.inv() * frame.T_WC
+                ).data.detach().cpu().clone()
+                current_chunk["poses"].append((frame.frame_id, T_CkCf))
+                if add_new_kf:
+                    current_chunk["end_frame_id"] = frame.frame_id
+                    chunks.append(current_chunk)
+                    current_chunk = {
+                        "start_frame_id": frame.frame_id,
+                        "end_frame_id": None,
+                        "poses": [],
+                    }
 
         elif mode == Mode.RELOC:
             X, C = mast3r_inference_mono(model, frame)
@@ -312,6 +330,13 @@ if __name__ == "__main__":
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
+        eval.save_poses(
+            save_dir,
+            f"{seq_name}_all.txt",
+            dataset.timestamps,
+            keyframes,
+            chunks,
+        )
         eval.save_reconstruction(
             save_dir,
             f"{seq_name}.ply",

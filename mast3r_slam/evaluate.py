@@ -1,6 +1,7 @@
 import pathlib
 from typing import Optional
 import cv2
+import lietorch
 import numpy as np
 import torch
 from mast3r_slam.dataloader import Intrinsics
@@ -41,6 +42,87 @@ def save_traj(
             else:
                 T_WC = intrinsics.refine_pose_with_calibration(keyframe)
             x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
+
+
+def save_poses(
+    logdir,
+    logfile,
+    timestamps,
+    keyframes: SharedKeyframes,
+    chunks,
+):
+    logdir = pathlib.Path(logdir)
+    logdir.mkdir(exist_ok=True, parents=True)
+    logfile = logdir / logfile
+    keyframe_poses = {}
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        keyframe_poses[keyframe.frame_id] = lietorch.Sim3(
+            keyframe.T_WC.data.detach().cpu().clone()
+        )
+
+    poses_by_frame_id = {
+        frame_id: as_SE3(T_WC) for frame_id, T_WC in keyframe_poses.items()
+    }
+
+    def normalize_quat(q):
+        return q / torch.linalg.norm(q)
+
+    def slerp_identity(q, alpha):
+        q = normalize_quat(q)
+        if q[-1] < 0:
+            q = -q
+
+        q0 = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=q.dtype)
+        dot = torch.clamp(q[-1], -1.0, 1.0)
+
+        if dot > 0.9995:
+            q_interp = (1.0 - alpha) * q0 + alpha * q
+            return normalize_quat(q_interp)
+
+        theta_0 = torch.acos(dot)
+        sin_theta_0 = torch.sin(theta_0)
+        theta = theta_0 * alpha
+        s0 = torch.sin(theta_0 - theta) / sin_theta_0
+        s1 = torch.sin(theta) / sin_theta_0
+        return s0 * q0 + s1 * q
+
+    def interpolate_delta(delta_data, alpha):
+        t = delta_data[:3] * alpha
+        q = slerp_identity(delta_data[3:7], alpha)
+        s = delta_data[7:8].pow(alpha)
+        return lietorch.Sim3(torch.cat([t, q, s], dim=0)[None])
+
+    for chunk in chunks:
+        start_frame_id = chunk["start_frame_id"]
+        end_frame_id = chunk["end_frame_id"]
+        poses = chunk["poses"]
+        if (
+            start_frame_id not in keyframe_poses
+            or end_frame_id not in keyframe_poses
+            or len(poses) == 0
+        ):
+            continue
+
+        T_WC_start = keyframe_poses[start_frame_id]
+        T_WC_end = keyframe_poses[end_frame_id]
+        _, end_pose_data = poses[-1]
+        T_CstartCend = lietorch.Sim3(end_pose_data)
+        T_chunk_correction = T_WC_start.inv() * T_WC_end * T_CstartCend.inv()
+        correction_data = T_chunk_correction.data.detach().cpu().reshape(-1)
+
+        for i, (frame_id, pose_data) in enumerate(poses, start=1):
+            alpha = i / len(poses)
+            T_interp = interpolate_delta(correction_data, alpha)
+            T_CstartCframe = lietorch.Sim3(pose_data)
+            poses_by_frame_id[frame_id] = as_SE3(T_WC_start * T_interp * T_CstartCframe)
+
+    with open(logfile, "w") as f:
+        for frame_id in sorted(poses_by_frame_id):
+            t = timestamps[frame_id]
+            T_WC = poses_by_frame_id[frame_id]
+            x, y, z, qx, qy, qz, qw = T_WC.data.cpu().numpy().reshape(-1)
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 

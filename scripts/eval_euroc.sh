@@ -1,6 +1,6 @@
 #!/bin/bash
 
-dataset_path="datasets/euroc/"
+dataset_path="/media/yuhao/bluessd/euroc_mav/machine_hall/"
 
 datasets=(
     MH_01_easy
@@ -8,12 +8,12 @@ datasets=(
     MH_03_medium
     MH_04_difficult
     MH_05_difficult
-    V1_01_easy
-    V1_02_medium
-    V1_03_difficult
-    V2_01_easy
-    V2_02_medium
-    V2_03_difficult
+    # V1_01_easy
+    # V1_02_medium
+    # V1_03_difficult
+    # V2_01_easy
+    # V2_02_medium
+    # V2_03_difficult
 )
 
 no_calib=false
@@ -45,13 +45,13 @@ if [ "$print_only" = false ]; then
     done
 fi
 
-for dataset in ${datasets[@]}; do
-    dataset_name="$dataset_path""$dataset"/
-    echo ${dataset_name}
-    if [ "$no_calib" = true ]; then
-        evo_ape tum groundtruths/euroc/$dataset.txt logs/euroc/no_calib/$dataset/$dataset.txt -as
-    else
-        evo_ape tum groundtruths/euroc/$dataset.txt logs/euroc/calib/$dataset/$dataset.txt -as
-    fi
+# for dataset in ${datasets[@]}; do
+#     dataset_name="$dataset_path""$dataset"/
+#     echo ${dataset_name}
+#     if [ "$no_calib" = true ]; then
+#         evo_ape tum groundtruths/euroc/$dataset.txt logs/euroc/no_calib/$dataset/$dataset.txt -as
+#     else
+#         evo_ape tum groundtruths/euroc/$dataset.txt logs/euroc/calib/$dataset/$dataset.txt -as
+#     fi
 
-done
+# done

@@ -1,4 +1,5 @@
 import pathlib
+from decimal import Decimal, ROUND_DOWN
 from typing import Optional
 import cv2
 import lietorch
@@ -133,23 +134,19 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     colors = []
     for i in range(len(keyframes)):
         keyframe = keyframes[i]
-        if config["use_calib"]:
-            X_canon = constrain_points_to_ray(
-                keyframe.img_shape.flatten()[:2], keyframe.X_canon[None], keyframe.K
-            )
-            keyframe.X_canon = X_canon.squeeze(0)
-        pW = keyframe.T_WC.act(keyframe.X_canon).cpu().numpy().reshape(-1, 3)
-        color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
-        valid = (
-            keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
-            > c_conf_threshold
-        )
-        pointclouds.append(pW[valid])
-        colors.append(color[valid])
+        pW, color = get_keyframe_pointcloud(keyframe, c_conf_threshold)
+        valid = len(pW) > 0
+        if not valid:
+            continue
+        pointclouds.append(pW)
+        colors.append(color)
+    if len(pointclouds) == 0:
+        save_pcd(savedir / filename, np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8))
+        return
     pointclouds = np.concatenate(pointclouds, axis=0)
     colors = np.concatenate(colors, axis=0)
 
-    save_ply(savedir / filename, pointclouds, colors)
+    save_pcd(savedir / filename, pointclouds, colors)
 
 
 def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
@@ -165,6 +162,60 @@ def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
                 (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
             ),
         )
+
+
+def get_keyframe_pointcloud(keyframe, c_conf_threshold):
+    X_canon = keyframe.X_canon
+    if config["use_calib"]:
+        X_canon = constrain_points_to_ray(
+            keyframe.img_shape.flatten()[:2], X_canon[None], keyframe.K
+        ).squeeze(0)
+
+    pW = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
+    color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
+    conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
+    valid = conf > c_conf_threshold
+    return pW[valid], color[valid]
+
+
+def get_keyframe_pointcloud_with_conf(keyframe):
+    X_canon = keyframe.X_canon
+    if config["use_calib"]:
+        X_canon = constrain_points_to_ray(
+            keyframe.img_shape.flatten()[:2], X_canon[None], keyframe.K
+        ).squeeze(0)
+
+    pW = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
+    color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
+    conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
+    return pW, color, conf
+
+
+def save_keyframe_pointclouds(savedir, timestamps, keyframes: SharedKeyframes):
+    savedir = pathlib.Path(savedir)
+    savedir.mkdir(exist_ok=True, parents=True)
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        t = timestamps[keyframe.frame_id]
+        points, colors, conf = get_keyframe_pointcloud_with_conf(keyframe)
+        save_pcd_with_conf(
+            savedir / f"{format_sec_nsec_timestamp(t)}.pcd", points, colors, conf
+        )
+
+
+def format_sec_nsec_timestamp(timestamp):
+    if isinstance(timestamp, str):
+        if "." in timestamp:
+            sec, frac = timestamp.split(".", 1)
+            nsec = "".join(ch for ch in frac if ch.isdigit())
+            nsec = (nsec + "0" * 9)[:9]
+            return f"{sec}_{nsec}"
+        return f"{timestamp}_000000000"
+
+    ts = Decimal(str(timestamp))
+    sec = int(ts.to_integral_value(rounding=ROUND_DOWN))
+    nsec = int(((ts - Decimal(sec)) * Decimal("1000000000")).to_integral_value(rounding=ROUND_DOWN))
+    return f"{sec}_{nsec:09d}"
 
 
 def save_ply(filename, points, colors):
@@ -186,3 +237,58 @@ def save_ply(filename, points, colors):
     vertex_element = PlyElement.describe(pcd, "vertex")
     ply_data = PlyData([vertex_element], text=False)
     ply_data.write(filename)
+
+
+def save_pcd(filename, points, colors):
+    colors = colors.astype(np.uint8)
+    rgb_packed = (
+        colors[:, 0].astype(np.uint32) << 16
+        | colors[:, 1].astype(np.uint32) << 8
+        | colors[:, 2].astype(np.uint32)
+    )
+
+    filename = pathlib.Path(filename)
+    with open(filename, "w") as f:
+        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
+        f.write("VERSION 0.7\n")
+        f.write("FIELDS x y z rgb\n")
+        f.write("SIZE 4 4 4 4\n")
+        f.write("TYPE F F F U\n")
+        f.write("COUNT 1 1 1 1\n")
+        f.write(f"WIDTH {len(points)}\n")
+        f.write("HEIGHT 1\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {len(points)}\n")
+        f.write("DATA ascii\n")
+        for point, rgb in zip(points, rgb_packed):
+            f.write(
+                f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} {int(rgb)}\n"
+            )
+
+
+def save_pcd_with_conf(filename, points, colors, conf):
+    colors = colors.astype(np.uint8)
+    conf = conf.astype(np.float32)
+    rgb_packed = (
+        colors[:, 0].astype(np.uint32) << 16
+        | colors[:, 1].astype(np.uint32) << 8
+        | colors[:, 2].astype(np.uint32)
+    )
+
+    filename = pathlib.Path(filename)
+    with open(filename, "w") as f:
+        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
+        f.write("VERSION 0.7\n")
+        f.write("FIELDS x y z rgb conf\n")
+        f.write("SIZE 4 4 4 4 4\n")
+        f.write("TYPE F F F U F\n")
+        f.write("COUNT 1 1 1 1 1\n")
+        f.write(f"WIDTH {len(points)}\n")
+        f.write("HEIGHT 1\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {len(points)}\n")
+        f.write("DATA ascii\n")
+        for point, rgb, c in zip(points, rgb_packed, conf):
+            f.write(
+                f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} {int(rgb)} {c:.8f}\n"
+            )

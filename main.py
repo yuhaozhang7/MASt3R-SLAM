@@ -183,7 +183,7 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w)
+    keyframes = SharedKeyframes(manager, h, w, 200)
     states = SharedStates(manager, h, w)
 
     if not args.no_viz:
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         traj_file = save_dir / f"{seq_name}.txt"
-        recon_file = save_dir / f"{seq_name}.ply"
+        recon_file = save_dir / f"{seq_name}.pcd"
         if traj_file.exists():
             traj_file.unlink()
         if recon_file.exists():
@@ -339,12 +339,17 @@ if __name__ == "__main__":
         )
         eval.save_reconstruction(
             save_dir,
-            f"{seq_name}.ply",
+            f"{seq_name}.pcd",
             keyframes,
             last_msg.C_conf_threshold,
         )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
+        )
+        eval.save_keyframe_pointclouds(
+            save_dir / "pointclouds",
+            dataset.timestamps,
+            keyframes
         )
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")

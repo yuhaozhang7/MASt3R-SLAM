@@ -149,6 +149,58 @@ class SevenScenesDataset(MonocularDataset):
         )
 
 
+class InstaDataset(MonocularDataset):
+    def __init__(self, dataset_path):
+        super().__init__()
+        max_duration_seconds = np.float64(100.0)
+        self.dataset_path = pathlib.Path(dataset_path)
+        image_dir = self.dataset_path / "slam_map" / "images" / "cam0_pinhole"
+        pose_csv = self.dataset_path / "slam_map" / "all_gt_poses.csv"
+        image_files = natsorted(list(image_dir.glob("image_*.jpg")))
+
+        image_files_by_stamp = {}
+        for rgb_file in image_files:
+            match = re.fullmatch(r"image_(\d+)_(\d+)\.jpg", rgb_file.name)
+            if match is None:
+                raise ValueError(f"Invalid Insta image filename: {rgb_file.name}")
+            image_files_by_stamp[match.groups()] = rgb_file
+
+        pose_data = np.loadtxt(
+            pose_csv,
+            delimiter=",",
+            comments="#",
+            dtype=np.unicode_,
+        )
+        pose_data = np.atleast_2d(pose_data)
+
+        self.rgb_files = []
+        timestamps = []
+        for _, sec, nsec, *_ in pose_data:
+            sec_str = sec
+            nsec_str = nsec.zfill(9)
+            rgb_file = image_files_by_stamp.get((sec_str, nsec_str))
+            assert (
+                rgb_file is not None
+            ), f"Missing Insta image for timestamp {sec_str}.{nsec_str:0>9}"
+            self.rgb_files.append(rgb_file)
+            timestamps.append(np.float64(sec_str) + np.float64(nsec_str) / 1e9)
+        self.timestamps = np.array(timestamps, dtype=np.float64)
+        if len(self.timestamps) > 0:
+            duration_mask = (self.timestamps - self.timestamps[0]) <= max_duration_seconds
+            self.rgb_files = [
+                rgb_file
+                for rgb_file, keep_frame in zip(self.rgb_files, duration_mask)
+                if keep_frame
+            ]
+            self.timestamps = self.timestamps[duration_mask]
+
+        fx, fy, cx, cy = 463.994229, 463.245244, 400.0, 300.0
+        W, H = 800, 600
+        self.camera_intrinsics = Intrinsics.from_calib(
+            self.img_size, W, H, [fx, fy, cx, cy]
+        )
+
+
 class RealsenseDataset(MonocularDataset):
     def __init__(self):
         super().__init__()
@@ -328,6 +380,8 @@ def load_dataset(dataset_path):
         return ETH3DDataset(dataset_path)
     if "7-scenes" in split_dataset_type:
         return SevenScenesDataset(dataset_path)
+    if "insta_frn" in split_dataset_type:
+        return InstaDataset(dataset_path)
     if "realsense" in split_dataset_type:
         return RealsenseDataset()
     if "webcam" in split_dataset_type:

@@ -333,6 +333,12 @@ if __name__ == "__main__":
         if current_chunk is not None:
             all_chunks.append(current_chunk)
         eval.save_full_traj(save_dir, "f_trajectory.txt", dataset, keyframes, all_chunks)
+        eval.save_full_traj_global_sim3(
+            save_dir, "f_trajectory_global_sim3.txt", dataset, keyframes, all_chunks
+        )
+        eval.save_full_traj_anchor_keyframe(
+            save_dir, "f_trajectory_anchor_keyframe.txt", dataset, keyframes, all_chunks
+        )
         eval.save_keyframe_traj(save_dir, "kf_trajectory.txt", dataset, keyframes)
         eval.save_reconstruction(
             save_dir,
@@ -345,7 +351,7 @@ if __name__ == "__main__":
         )
         eval.save_keyframe_pointclouds(
             save_dir / "pointclouds",
-            dataset.timestamps,
+            dataset,
             keyframes
         )
     if save_frames:

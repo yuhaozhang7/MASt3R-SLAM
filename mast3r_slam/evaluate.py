@@ -52,6 +52,25 @@ def get_timestamp_string(dataset, frame_id):
     return f"{float(dataset.timestamps[frame_id]):.10f}"
 
 
+def format_sec_nsec_timestamp(timestamp):
+    if isinstance(timestamp, str):
+        if "." in timestamp:
+            sec, frac = timestamp.split(".", 1)
+            nsec = "".join(ch for ch in frac if ch.isdigit())
+            nsec = (nsec + "0" * 9)[:9]
+            return f"{sec}_{nsec}"
+        return f"{timestamp}_000000000"
+
+    ts = Decimal(str(timestamp))
+    sec = int(ts.to_integral_value(rounding=ROUND_DOWN))
+    nsec = int(
+        ((ts - Decimal(sec)) * Decimal("1000000000")).to_integral_value(
+            rounding=ROUND_DOWN
+        )
+    )
+    return f"{sec}_{nsec:09d}"
+
+
 def save_keyframe_traj(logdir, logfile, dataset, keyframes: SharedKeyframes):
     logdir = pathlib.Path(logdir)
     logdir.mkdir(exist_ok=True, parents=True)
@@ -156,6 +175,107 @@ def save_full_traj(logdir, logfile, dataset, keyframes: SharedKeyframes, chunks)
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 
+def save_full_traj_global_sim3(
+    logdir, logfile, dataset, keyframes: SharedKeyframes, chunks
+):
+    logdir = pathlib.Path(logdir)
+    logdir.mkdir(exist_ok=True, parents=True)
+    logfile = logdir / logfile
+
+    keyframe_poses = {}
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        keyframe_poses[keyframe.frame_id] = lietorch.Sim3(
+            keyframe.T_WC.data.detach().cpu().clone()
+        )
+
+    poses_by_frame_id = {
+        frame_id: as_SE3(T_WC) for frame_id, T_WC in keyframe_poses.items()
+    }
+
+    unfinished_chunks = [chunk for chunk in chunks if chunk["end_frame_id"] is None]
+    assert len(unfinished_chunks) <= 1, "At most one unfinished last chunk is expected."
+
+    for chunk in chunks:
+        start_frame_id = chunk["start_frame_id"]
+        end_frame_id = chunk["end_frame_id"]
+        poses = chunk["poses"]
+
+        if start_frame_id not in keyframe_poses:
+            continue
+
+        T_WC_start = keyframe_poses[start_frame_id]
+
+        if end_frame_id is None or end_frame_id not in keyframe_poses or len(poses) == 0:
+            for frame_id, pose_data in poses:
+                poses_by_frame_id[frame_id] = as_SE3(
+                    T_WC_start * lietorch.Sim3(pose_data)
+                )
+            continue
+
+        last_frame_id, _ = poses[-1]
+        assert (
+            last_frame_id == end_frame_id
+        ), "For a closed chunk, the last stored pose must correspond to the ending keyframe."
+
+        T_WC_end = keyframe_poses[end_frame_id]
+        _, end_pose_data = poses[-1]
+        T_CstartCend = lietorch.Sim3(end_pose_data)
+        T_chunk_correction = T_WC_start.inv() * T_WC_end * T_CstartCend.inv()
+
+        for frame_id, pose_data in poses[:-1]:
+            T_CstartCframe = lietorch.Sim3(pose_data)
+            poses_by_frame_id[frame_id] = as_SE3(
+                T_WC_start * T_chunk_correction * T_CstartCframe
+            )
+
+    with open(logfile, "w") as f:
+        for frame_id in sorted(poses_by_frame_id):
+            T_WC = poses_by_frame_id[frame_id]
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            t = get_timestamp_string(dataset, frame_id)
+            f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
+
+
+def save_full_traj_anchor_keyframe(
+    logdir, logfile, dataset, keyframes: SharedKeyframes, chunks
+):
+    logdir = pathlib.Path(logdir)
+    logdir.mkdir(exist_ok=True, parents=True)
+    logfile = logdir / logfile
+
+    keyframe_poses = {}
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        keyframe_poses[keyframe.frame_id] = lietorch.Sim3(
+            keyframe.T_WC.data.detach().cpu().clone()
+        )
+
+    poses_by_frame_id = {
+        frame_id: as_SE3(T_WC) for frame_id, T_WC in keyframe_poses.items()
+    }
+
+    for chunk in chunks:
+        start_frame_id = chunk["start_frame_id"]
+        poses = chunk["poses"]
+
+        if start_frame_id not in keyframe_poses:
+            continue
+
+        T_WC_start = keyframe_poses[start_frame_id]
+        for frame_id, pose_data in poses:
+            poses_by_frame_id[frame_id] = as_SE3(
+                T_WC_start * lietorch.Sim3(pose_data)
+            )
+
+    with open(logfile, "w") as f:
+        for frame_id in sorted(poses_by_frame_id):
+            T_WC = poses_by_frame_id[frame_id]
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            t = get_timestamp_string(dataset, frame_id)
+            f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
+
+
 def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     savedir = pathlib.Path(savedir)
     savedir.mkdir(exist_ok=True, parents=True)
@@ -163,11 +283,13 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     colors = []
     for i in range(len(keyframes)):
         keyframe = keyframes[i]
-        pW, color = get_keyframe_pointcloud(keyframe, c_conf_threshold)
-        valid = len(pW) > 0
+        points_world, color = get_keyframe_pointcloud_world(
+            keyframe, c_conf_threshold
+        )
+        valid = len(points_world) > 0
         if not valid:
             continue
-        pointclouds.append(pW)
+        pointclouds.append(points_world)
         colors.append(color)
     if len(pointclouds) == 0:
         save_pcd(savedir / filename, np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8))
@@ -193,58 +315,46 @@ def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
         )
 
 
-def get_keyframe_pointcloud(keyframe, c_conf_threshold):
+def get_keyframe_pointcloud_world(keyframe, c_conf_threshold):
     X_canon = keyframe.X_canon
     if config["use_calib"]:
         X_canon = constrain_points_to_ray(
             keyframe.img_shape.flatten()[:2], X_canon[None], keyframe.K
         ).squeeze(0)
 
-    pW = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
+    points_world = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
     color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
     conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
     valid = conf > c_conf_threshold
-    return pW[valid], color[valid]
+    return points_world[valid], color[valid]
 
 
-def get_keyframe_pointcloud_with_conf(keyframe):
+def get_keyframe_pointcloud_local(keyframe):
     X_canon = keyframe.X_canon
     if config["use_calib"]:
         X_canon = constrain_points_to_ray(
             keyframe.img_shape.flatten()[:2], X_canon[None], keyframe.K
         ).squeeze(0)
 
-    pW = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
+    # In the current MASt3R-SLAM pipeline, global optimization updates T_WC
+    # only; X_canon stays in the keyframe-local canonical frame and does not
+    # absorb the optimized Sim3 scale. Apply that scale here, while keeping the
+    # saved pointcloud in the keyframe's local frame.
+    scale = keyframe.T_WC.data.detach().cpu().reshape(-1)[7]
+    points_local = (X_canon * scale).cpu().numpy().reshape(-1, 3)
     color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
     conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
-    return pW, color, conf
+    return points_local, color, conf
 
 
-def save_keyframe_pointclouds(savedir, timestamps, keyframes: SharedKeyframes):
+def save_keyframe_pointclouds(savedir, dataset, keyframes: SharedKeyframes):
     savedir = pathlib.Path(savedir)
     savedir.mkdir(exist_ok=True, parents=True)
     for i in range(len(keyframes)):
         keyframe = keyframes[i]
-        t = timestamps[keyframe.frame_id]
-        points, colors, conf = get_keyframe_pointcloud_with_conf(keyframe)
-        save_pcd_with_conf(
-            savedir / f"{format_sec_nsec_timestamp(t)}.pcd", points, colors, conf
-        )
-
-
-def format_sec_nsec_timestamp(timestamp):
-    if isinstance(timestamp, str):
-        if "." in timestamp:
-            sec, frac = timestamp.split(".", 1)
-            nsec = "".join(ch for ch in frac if ch.isdigit())
-            nsec = (nsec + "0" * 9)[:9]
-            return f"{sec}_{nsec}"
-        return f"{timestamp}_000000000"
-
-    ts = Decimal(str(timestamp))
-    sec = int(ts.to_integral_value(rounding=ROUND_DOWN))
-    nsec = int(((ts - Decimal(sec)) * Decimal("1000000000")).to_integral_value(rounding=ROUND_DOWN))
-    return f"{sec}_{nsec:09d}"
+        t = format_sec_nsec_timestamp(get_timestamp_string(dataset, keyframe.frame_id))
+        points, colors, conf = get_keyframe_pointcloud_local(keyframe)
+        save_pcd_with_conf(savedir / f"{t}.pcd", points, colors, conf)
 
 
 def save_ply(filename, points, colors):

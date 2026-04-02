@@ -22,6 +22,7 @@ class MonocularDataset(torch.utils.data.Dataset):
         self.dtype = dtype
         self.rgb_files = []
         self.timestamps = []
+        self.timestamp_strings = []
         self.img_size = 512
         self.camera_intrinsics = None
         self.use_calibration = config["use_calib"]
@@ -59,6 +60,8 @@ class MonocularDataset(torch.utils.data.Dataset):
     def subsample(self, subsample):
         self.rgb_files = self.rgb_files[::subsample]
         self.timestamps = self.timestamps[::subsample]
+        if len(self.timestamp_strings) > 0:
+            self.timestamp_strings = self.timestamp_strings[::subsample]
 
     def has_calib(self):
         return self.camera_intrinsics is not None
@@ -101,8 +104,15 @@ class EurocDataset(MonocularDataset):
         self.rgb_files = [
             self.dataset_path / "mav0/cam0/data" / f for f in tstamp_rgb[:, 1]
         ]
-        # EuRoC camera timestamps are stored in nanoseconds; TUM trajectories expect seconds.
-        self.timestamps = tstamp_rgb[:, 0].astype(np.float64) / 1e9
+        raw_timestamps = tstamp_rgb[:, 0].astype(np.unicode_)
+        self.timestamp_strings = []
+        for stamp in raw_timestamps:
+            digits = "".join(ch for ch in str(stamp) if ch.isdigit())
+            if len(digits) > 9:
+                self.timestamp_strings.append(f"{digits[:-9]}.{digits[-9:]}")
+            else:
+                self.timestamp_strings.append(f"0.{digits.zfill(9)}")
+        self.timestamps = np.array(self.timestamp_strings, dtype=np.float64)
         with open(self.dataset_path / "mav0/cam0/sensor.yaml") as f:
             self.cam0 = yaml.load(f, Loader=yaml.FullLoader)
         W, H = self.cam0["resolution"]
@@ -155,41 +165,30 @@ class InstaDataset(MonocularDataset):
         max_duration_seconds = np.float64(100.0)
         self.dataset_path = pathlib.Path(dataset_path)
         image_dir = self.dataset_path / "slam_map" / "images" / "cam0_pinhole"
-        pose_csv = self.dataset_path / "slam_map" / "all_gt_poses.csv"
         image_files = natsorted(list(image_dir.glob("image_*.jpg")))
 
-        image_files_by_stamp = {}
+        self.rgb_files = []
+        self.timestamp_strings = []
         for rgb_file in image_files:
             match = re.fullmatch(r"image_(\d+)_(\d+)\.jpg", rgb_file.name)
             if match is None:
                 raise ValueError(f"Invalid Insta image filename: {rgb_file.name}")
-            image_files_by_stamp[match.groups()] = rgb_file
-
-        pose_data = np.loadtxt(
-            pose_csv,
-            delimiter=",",
-            comments="#",
-            dtype=np.unicode_,
-        )
-        pose_data = np.atleast_2d(pose_data)
-
-        self.rgb_files = []
-        timestamps = []
-        for _, sec, nsec, *_ in pose_data:
-            sec_str = sec
-            nsec_str = nsec.zfill(9)
-            rgb_file = image_files_by_stamp.get((sec_str, nsec_str))
-            assert (
-                rgb_file is not None
-            ), f"Missing Insta image for timestamp {sec_str}.{nsec_str:0>9}"
+            sec_str, nsec_str = match.groups()
+            nsec_str = nsec_str.zfill(9)
             self.rgb_files.append(rgb_file)
-            timestamps.append(np.float64(sec_str) + np.float64(nsec_str) / 1e9)
-        self.timestamps = np.array(timestamps, dtype=np.float64)
+            self.timestamp_strings.append(f"{sec_str}.{nsec_str}")
+
+        self.timestamps = np.array(self.timestamp_strings, dtype=np.float64)
         if len(self.timestamps) > 0:
             duration_mask = (self.timestamps - self.timestamps[0]) <= max_duration_seconds
             self.rgb_files = [
                 rgb_file
                 for rgb_file, keep_frame in zip(self.rgb_files, duration_mask)
+                if keep_frame
+            ]
+            self.timestamp_strings = [
+                ts
+                for ts, keep_frame in zip(self.timestamp_strings, duration_mask)
                 if keep_frame
             ]
             self.timestamps = self.timestamps[duration_mask]

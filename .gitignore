@@ -133,6 +133,7 @@ dmypy.json
 ckpt/
 datasets
 logs/
+logs_back/
 *.prof
 screen.yaml
 *.pt

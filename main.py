@@ -329,14 +329,11 @@ if __name__ == "__main__":
 
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-        eval.save_poses(
-            save_dir,
-            f"{seq_name}_all.txt",
-            dataset.timestamps,
-            keyframes,
-            chunks,
-        )
+        all_chunks = list(chunks)
+        if current_chunk is not None:
+            all_chunks.append(current_chunk)
+        eval.save_full_traj(save_dir, "f_trajectory.txt", dataset, keyframes, all_chunks)
+        eval.save_keyframe_traj(save_dir, "kf_trajectory.txt", dataset, keyframes)
         eval.save_reconstruction(
             save_dir,
             f"{seq_name}.pcd",

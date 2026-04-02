@@ -46,16 +46,30 @@ def save_traj(
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 
-def save_poses(
-    logdir,
-    logfile,
-    timestamps,
-    keyframes: SharedKeyframes,
-    chunks,
-):
+def get_timestamp_string(dataset, frame_id):
+    if hasattr(dataset, "timestamp_strings") and len(dataset.timestamp_strings) > frame_id:
+        return str(dataset.timestamp_strings[frame_id])
+    return f"{float(dataset.timestamps[frame_id]):.10f}"
+
+
+def save_keyframe_traj(logdir, logfile, dataset, keyframes: SharedKeyframes):
     logdir = pathlib.Path(logdir)
     logdir.mkdir(exist_ok=True, parents=True)
     logfile = logdir / logfile
+    with open(logfile, "w") as f:
+        for i in range(len(keyframes)):
+            keyframe = keyframes[i]
+            T_WC = as_SE3(keyframe.T_WC)
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            t = get_timestamp_string(dataset, keyframe.frame_id)
+            f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
+
+
+def save_full_traj(logdir, logfile, dataset, keyframes: SharedKeyframes, chunks):
+    logdir = pathlib.Path(logdir)
+    logdir.mkdir(exist_ok=True, parents=True)
+    logfile = logdir / logfile
+
     keyframe_poses = {}
     for i in range(len(keyframes)):
         keyframe = keyframes[i]
@@ -95,35 +109,50 @@ def save_poses(
         s = delta_data[7:8].pow(alpha)
         return lietorch.Sim3(torch.cat([t, q, s], dim=0)[None])
 
+    unfinished_chunks = [chunk for chunk in chunks if chunk["end_frame_id"] is None]
+    assert len(unfinished_chunks) <= 1, "At most one unfinished last chunk is expected."
+
     for chunk in chunks:
         start_frame_id = chunk["start_frame_id"]
         end_frame_id = chunk["end_frame_id"]
         poses = chunk["poses"]
-        if (
-            start_frame_id not in keyframe_poses
-            or end_frame_id not in keyframe_poses
-            or len(poses) == 0
-        ):
+
+        if start_frame_id not in keyframe_poses:
             continue
 
         T_WC_start = keyframe_poses[start_frame_id]
+
+        if end_frame_id is None or end_frame_id not in keyframe_poses or len(poses) == 0:
+            for frame_id, pose_data in poses:
+                poses_by_frame_id[frame_id] = as_SE3(
+                    T_WC_start * lietorch.Sim3(pose_data)
+                )
+            continue
+
+        last_frame_id, _ = poses[-1]
+        assert (
+            last_frame_id == end_frame_id
+        ), "For a closed chunk, the last stored pose must correspond to the ending keyframe."
+
         T_WC_end = keyframe_poses[end_frame_id]
         _, end_pose_data = poses[-1]
         T_CstartCend = lietorch.Sim3(end_pose_data)
         T_chunk_correction = T_WC_start.inv() * T_WC_end * T_CstartCend.inv()
         correction_data = T_chunk_correction.data.detach().cpu().reshape(-1)
 
-        for i, (frame_id, pose_data) in enumerate(poses, start=1):
+        for i, (frame_id, pose_data) in enumerate(poses[:-1], start=1):
             alpha = i / len(poses)
             T_interp = interpolate_delta(correction_data, alpha)
             T_CstartCframe = lietorch.Sim3(pose_data)
-            poses_by_frame_id[frame_id] = as_SE3(T_WC_start * T_interp * T_CstartCframe)
+            poses_by_frame_id[frame_id] = as_SE3(
+                T_WC_start * T_interp * T_CstartCframe
+            )
 
     with open(logfile, "w") as f:
         for frame_id in sorted(poses_by_frame_id):
-            t = timestamps[frame_id]
             T_WC = poses_by_frame_id[frame_id]
-            x, y, z, qx, qy, qz, qw = T_WC.data.cpu().numpy().reshape(-1)
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            t = get_timestamp_string(dataset, frame_id)
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 

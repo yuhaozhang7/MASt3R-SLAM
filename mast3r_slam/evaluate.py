@@ -4,13 +4,13 @@ from typing import Optional
 import cv2
 import lietorch
 import numpy as np
+import open3d as o3d
 import torch
 from mast3r_slam.dataloader import Intrinsics
 from mast3r_slam.frame import SharedKeyframes
 from mast3r_slam.lietorch_utils import as_SE3
 from mast3r_slam.config import config
 from mast3r_slam.geometry import constrain_points_to_ray
-from plyfile import PlyData, PlyElement
 
 
 def prepare_savedir(args, dataset):
@@ -286,8 +286,7 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
         points_world, color = get_keyframe_pointcloud_world(
             keyframe, c_conf_threshold
         )
-        valid = len(points_world) > 0
-        if not valid:
+        if len(points_world) == 0:
             continue
         pointclouds.append(points_world)
         colors.append(color)
@@ -315,7 +314,19 @@ def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
         )
 
 
-def get_keyframe_pointcloud_world(keyframe, c_conf_threshold):
+def get_conf_mask(conf, c_conf_threshold=None):
+    conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+    if conf.size == 0:
+        return np.zeros((0,), dtype=bool)
+    if c_conf_threshold is None:
+        threshold = np.percentile(conf, 25)
+        threshold = max(threshold, 1.5)
+    else:
+        threshold = c_conf_threshold
+    return conf >= threshold
+
+
+def _get_keyframe_pointcloud_world_raw(keyframe):
     X_canon = keyframe.X_canon
     if config["use_calib"]:
         X_canon = constrain_points_to_ray(
@@ -325,109 +336,107 @@ def get_keyframe_pointcloud_world(keyframe, c_conf_threshold):
     points_world = keyframe.T_WC.act(X_canon).cpu().numpy().reshape(-1, 3)
     color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
     conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
-    valid = conf > c_conf_threshold
+    return points_world, color, conf
+
+
+def get_keyframe_pointcloud_world(keyframe, c_conf_threshold=None):
+    points_world, color, conf = _get_keyframe_pointcloud_world_raw(keyframe)
+    valid = get_conf_mask(conf, c_conf_threshold)
     return points_world[valid], color[valid]
 
 
-def get_keyframe_pointcloud_local(keyframe):
-    X_canon = keyframe.X_canon
-    if config["use_calib"]:
-        X_canon = constrain_points_to_ray(
-            keyframe.img_shape.flatten()[:2], X_canon[None], keyframe.K
-        ).squeeze(0)
-
-    # In the current MASt3R-SLAM pipeline, global optimization updates T_WC
-    # only; X_canon stays in the keyframe-local canonical frame and does not
-    # absorb the optimized Sim3 scale. Apply that scale here, while keeping the
-    # saved pointcloud in the keyframe's local frame.
-    scale = keyframe.T_WC.data.detach().cpu().reshape(-1)[7]
-    points_local = (X_canon * scale).cpu().numpy().reshape(-1, 3)
-    color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
-    conf = keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
-    return points_local, color, conf
-
-
-def save_keyframe_pointclouds(savedir, dataset, keyframes: SharedKeyframes):
+def save_frame_pointclouds(savedir, dataset, keyframes: SharedKeyframes, chunks):
     savedir = pathlib.Path(savedir)
     savedir.mkdir(exist_ok=True, parents=True)
+
+    keyframes_by_frame_id = {}
+    poses_by_frame_id = {}
+    ref_keyframe_by_frame_id = {}
     for i in range(len(keyframes)):
         keyframe = keyframes[i]
-        t = format_sec_nsec_timestamp(get_timestamp_string(dataset, keyframe.frame_id))
-        points, colors, conf = get_keyframe_pointcloud_local(keyframe)
-        save_pcd_with_conf(savedir / f"{t}.pcd", points, colors, conf)
+        keyframes_by_frame_id[keyframe.frame_id] = keyframe
+        poses_by_frame_id[keyframe.frame_id] = as_SE3(keyframe.T_WC)
+        ref_keyframe_by_frame_id[keyframe.frame_id] = keyframe.frame_id
+
+    for chunk in chunks:
+        start_frame_id = chunk["start_frame_id"]
+        poses = chunk["poses"]
+        if start_frame_id not in keyframes_by_frame_id:
+            continue
+
+        T_WC_start = lietorch.Sim3(
+            keyframes_by_frame_id[start_frame_id].T_WC.data.detach().cpu().clone()
+        )
+        for frame_id, pose_data in poses:
+            poses_by_frame_id[frame_id] = as_SE3(T_WC_start * lietorch.Sim3(pose_data))
+            ref_keyframe_by_frame_id[frame_id] = start_frame_id
+
+    if len(poses_by_frame_id) == 0:
+        return
+
+    if getattr(dataset, "camera_intrinsics", None) is not None:
+        K = torch.from_numpy(dataset.camera_intrinsics.K_frame).to(dtype=torch.float32)
+    elif config["use_calib"] and len(keyframes) > 0 and keyframes[0].K is not None:
+        K = keyframes[0].K.detach().cpu().to(dtype=torch.float32)
+    else:
+        raise ValueError(
+            "Frame pointcloud export requires intrinsics to compute each frame FOV."
+        )
+
+    sample_keyframe = keyframes[0]
+    height, width = sample_keyframe.img_shape.flatten()[:2].detach().cpu().tolist()
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+
+    for frame_id in sorted(poses_by_frame_id):
+        ref_keyframe = keyframes_by_frame_id[ref_keyframe_by_frame_id[frame_id]]
+        points_world, colors = get_keyframe_pointcloud_world(ref_keyframe)
+
+        if len(points_world) == 0:
+            points_frame = np.empty((0, 3), dtype=np.float32)
+            colors_frame = np.empty((0, 3), dtype=np.uint8)
+        else:
+            points_world_t = torch.from_numpy(points_world).to(dtype=torch.float32)
+            T_WC_frame = poses_by_frame_id[frame_id]
+            points_frame_t = T_WC_frame.inv().act(points_world_t)
+            points_frame = points_frame_t.detach().cpu().numpy().reshape(-1, 3)
+
+            z = points_frame[:, 2]
+            valid_z = z > 0
+            u = fx * (points_frame[:, 0] / np.maximum(z, 1e-8)) + cx
+            v = fy * (points_frame[:, 1] / np.maximum(z, 1e-8)) + cy
+            valid_fov = (
+                valid_z
+                & (u >= 0.0)
+                & (u < float(width))
+                & (v >= 0.0)
+                & (v < float(height))
+            )
+
+            points_frame = points_frame[valid_fov]
+            colors_frame = colors[valid_fov]
+
+        t = format_sec_nsec_timestamp(get_timestamp_string(dataset, frame_id))
+        save_pcd(savedir / f"{t}.pcd", points_frame, colors_frame)
 
 
 def save_ply(filename, points, colors):
-    colors = colors.astype(np.uint8)
-    # Combine XYZ and RGB into a structured array
-    pcd = np.empty(
-        len(points),
-        dtype=[
-            ("x", "f4"),
-            ("y", "f4"),
-            ("z", "f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-        ],
-    )
-    pcd["x"], pcd["y"], pcd["z"] = points.T
-    pcd["red"], pcd["green"], pcd["blue"] = colors.T
-    vertex_element = PlyElement.describe(pcd, "vertex")
-    ply_data = PlyData([vertex_element], text=False)
-    ply_data.write(filename)
+    save_pointcloud(filename, points, colors)
 
 
 def save_pcd(filename, points, colors):
-    colors = colors.astype(np.uint8)
-    rgb_packed = (
-        colors[:, 0].astype(np.uint32) << 16
-        | colors[:, 1].astype(np.uint32) << 8
-        | colors[:, 2].astype(np.uint32)
-    )
+    save_pointcloud(filename, points, colors)
 
+
+def save_pointcloud(filename, points, colors):
     filename = pathlib.Path(filename)
-    with open(filename, "w") as f:
-        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
-        f.write("VERSION 0.7\n")
-        f.write("FIELDS x y z rgb\n")
-        f.write("SIZE 4 4 4 4\n")
-        f.write("TYPE F F F U\n")
-        f.write("COUNT 1 1 1 1\n")
-        f.write(f"WIDTH {len(points)}\n")
-        f.write("HEIGHT 1\n")
-        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-        f.write(f"POINTS {len(points)}\n")
-        f.write("DATA ascii\n")
-        for point, rgb in zip(points, rgb_packed):
-            f.write(
-                f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} {int(rgb)}\n"
-            )
-
-
-def save_pcd_with_conf(filename, points, colors, conf):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
     colors = colors.astype(np.uint8)
-    conf = conf.astype(np.float32)
-    rgb_packed = (
-        colors[:, 0].astype(np.uint32) << 16
-        | colors[:, 1].astype(np.uint32) << 8
-        | colors[:, 2].astype(np.uint32)
-    )
-
-    filename = pathlib.Path(filename)
-    with open(filename, "w") as f:
-        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
-        f.write("VERSION 0.7\n")
-        f.write("FIELDS x y z rgb conf\n")
-        f.write("SIZE 4 4 4 4 4\n")
-        f.write("TYPE F F F U F\n")
-        f.write("COUNT 1 1 1 1 1\n")
-        f.write(f"WIDTH {len(points)}\n")
-        f.write("HEIGHT 1\n")
-        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-        f.write(f"POINTS {len(points)}\n")
-        f.write("DATA ascii\n")
-        for point, rgb, c in zip(points, rgb_packed, conf):
-            f.write(
-                f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} {int(rgb)} {c:.8f}\n"
-            )
+    colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    if len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+    o3d.io.write_point_cloud(str(filename), pcd)

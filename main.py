@@ -344,15 +344,16 @@ if __name__ == "__main__":
             save_dir,
             f"{seq_name}.pcd",
             keyframes,
-            last_msg.C_conf_threshold,
+            None,
         )
-        eval.save_keyframes(
-            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-        )
-        eval.save_keyframe_pointclouds(
+        # eval.save_keyframes(
+        #     save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
+        # )
+        eval.save_frame_pointclouds(
             save_dir / "pointclouds",
             dataset,
-            keyframes
+            keyframes,
+            all_chunks,
         )
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")

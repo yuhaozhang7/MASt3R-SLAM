@@ -3,8 +3,8 @@
 dataset_path="/media/yuhao/bluessd/insta_frn/"
 
 datasets=(
-    /2026-01-31_run1/
-    /2026-01-31_run2/
+    # /2026-01-31_run1/
+    # /2026-01-31_run2/
     /2026-01-31_run3/
     /2026-03-07_run1/
     /2026-03-07_run3/

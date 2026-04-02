@@ -13,7 +13,7 @@ dependencies = [
     "natsort",
     # "torchcodec==0.1",
     "lietorch @ git+https://github.com/princeton-vl/lietorch.git",
-    "plyfile",
+    "open3d",
 ]
 
 [tool.setuptools.packages.find]
